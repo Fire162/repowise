@@ -443,29 +443,36 @@ def _select(repo_path, change, result: dict, config):
     from repowise.core.analysis.changed_lines import index_gap
     from repowise.core.analysis.test_selection import (
         SelectionInput,
-        doc_readers,
+        file_namers,
         is_documentation,
         is_runnable_test,
         is_scan_source,
+        needs_namers,
         plugin_loader,
         pytest_testpaths,
         select_tests,
+        trigger_scopes,
     )
 
-    named = {g["test_file"] for g in result["inferred"]}
-    named |= {i["test_file"] for i in result["covered"].values() if i["test_file"]}
     root = Path(repo_path)
     tracked = git_refs.tracked_paths(str(root))
     go_test_dirs = {str(Path(p).parent.as_posix()) for p in tracked if p.endswith("_test.go")}
     known_tests = sorted(p for p in tracked if is_runnable_test(p))
     placed = result["placed_tests"]
-    docs = [p for p in (*change.files, *change.deleted) if is_documentation(p)]
+    paths = [*change.files, *change.deleted]
     sources = [p for p in tracked if is_scan_source(p)]
+    # One read of the sources answers who names every changed doc or asset.
+    asked = [p for p in paths if needs_namers(p, config)]
+    namers = file_namers(asked, _texts(root, sources)) if asked else {}
+    scopes = trigger_scopes(paths, tracked, namers, config)
+    tiers = _with_routes(repo_path, result, scopes, paths)
+    named = {g["test_file"] for g in tiers["inferred"]}
+    named |= {i["test_file"] for i in tiers["covered"].values() if i["test_file"]}
     return select_tests(
         SelectionInput(
             changed=change.files,
             deleted=change.deleted,
-            tiers=result,
+            tiers=tiers,
             config=config,
             index_available=not result["no_index"],
             label=change.label,
@@ -477,12 +484,57 @@ def _select(repo_path, change, result: dict, config):
             missing={f for f in named if not (root / f).is_file()},
             go_test_dirs=go_test_dirs,
             known_tests=known_tests,
-            doc_readers=doc_readers(docs, _texts(root, sources)) if docs else {},
+            doc_readers={p: n[0] for p, n in namers.items() if is_documentation(p)},
             plugin_loader=plugin_loader(_texts(root, sources, pytest_only=True)),
             unplaced_tests=[] if placed is None else [t for t in known_tests if t not in placed],
             pytest_testpaths=pytest_testpaths(lambda name: _text(root / name)),
+            scopes=scopes,
         )
     )
+
+
+def _with_routes(repo_path, result: dict, scopes: dict, paths: list[str]) -> dict:
+    """*result* plus the graph's tests for every file a scope routes through.
+
+    Those files did not change, so they are walked only for their tests: no
+    filename guess, nothing listed as unknown. A graph read that fails is
+    recorded like any other, so selection runs everything.
+    """
+    routes = sorted({r for s in scopes.values() for r in s.routes} - set(paths))
+    if not routes or result["no_index"] or result["graph_error"] is not None:
+        return result
+    covered = {test: dict(info) for test, info in result["covered"].items()}
+    tiers = {**result, "inferred": list(result["inferred"]), "covered": covered}
+    run_async(_route_tests(repo_path, routes, tiers))
+    return tiers
+
+
+async def _route_tests(repo_path, routes: list[str], tiers: dict) -> None:
+    from repowise.core.persistence.crud import tests_covering
+
+    async with repo_index_session(Path(repo_path)) as opened:
+        if opened is None:
+            tiers["graph_error"] = "the index could not be opened again"
+            return
+        session, repo_id = opened
+        try:
+            candidates, importers = await _graph_candidates(session, repo_id, routes)
+            # Coverage per route only when a map exists: one query per file.
+            for route in [] if tiers["map_empty"] else routes:
+                for r in await tests_covering(session, repo_id, route, lines=None):
+                    entry = tiers["covered"].setdefault(
+                        r["test_id"], {"test_file": r["test_file"], "source_files": []}
+                    )
+                    entry["source_files"] = [*entry["source_files"], route]
+        except Exception as exc:
+            tiers["graph_error"] = f"{type(exc).__name__}: {exc}"
+            return
+    tiers["helper_importers"] = {**tiers["helper_importers"], **importers}
+    tiers["inferred"] += [
+        {"source_file": route, "test_file": t, "via": via}
+        for route, found in candidates.items()
+        for t, via in found
+    ]
 
 
 def _text(path: Path) -> str | None:

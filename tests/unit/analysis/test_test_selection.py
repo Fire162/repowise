@@ -14,12 +14,14 @@ from repowise.core.analysis.test_selection import (
     SelectionInput,
     TestSelectionConfig,
     doc_readers,
+    file_namers,
     format_args,
     plugin_loader,
     pytest_testpaths,
     resolve_runner,
     runner_args,
     select_tests,
+    trigger_scopes,
 )
 
 _NONE = TestSelectionConfig()
@@ -699,3 +701,177 @@ def test_pytest_is_not_given_production_modules_outside_testpaths() -> None:
 )
 def test_pytest_testpaths_reads_the_config_pytest_reads(files, expected) -> None:
     assert pytest_testpaths(files.get) == expected
+
+
+# -- scoped triggers ----------------------------------------------------------
+
+_TRACKED = (
+    "package.json",
+    "pyproject.toml",
+    "web/package.json",
+    "web/src/app.ts",
+    "web/src/app.test.ts",
+    "web/src/styles/layout.css",
+    "web/e2e/login.spec.ts",
+    "svc/go.mod",
+    "svc/main.go",
+    "svc/main_test.go",
+    "src/pkg/__init__.py",
+    "src/pkg/core.py",
+    "src/pkg/sub/deep.py",
+    "src/other.py",
+    "tests/test_core.py",
+    "tests/fixtures/package.json",
+    "crate/Cargo.toml",
+    "assets/logo.svg",
+)
+_SCOPE_TESTS = [
+    "web/src/app.test.ts",
+    "web/e2e/login.spec.ts",
+    "svc/main_test.go",
+    "tests/test_core.py",
+]
+
+
+def _scopes(paths, namers=None, config=_NONE):
+    return trigger_scopes(paths, _TRACKED, namers or {}, config)
+
+
+@pytest.mark.parametrize(
+    ("path", "root", "suffix", "reach"),
+    [
+        ("web/package.json", "web", ".ts", ("web/src/app.ts",)),
+        ("web/package-lock.json", "web", ".ts", ("web/src/app.ts",)),
+        ("package.json", ".", ".ts", ()),
+        ("web/tsconfig.json", ".", ".ts", ()),
+        ("uv.lock", ".", ".py", ()),
+        ("services/api/pyproject.toml", ".", ".py", ()),
+        ("requirements-dev.txt", ".", ".py", ()),
+        ("svc/go.sum", "svc", ".go", ("svc/main.go",)),
+        ("Gemfile.lock", ".", ".rb", ()),
+        ("app/build.gradle.kts", ".", ".kt", ()),
+    ],
+)
+def test_a_manifest_or_lockfile_scopes_to_its_ecosystem(path, root, suffix, reach) -> None:
+    scope = _scopes([path])[path]
+    assert (scope.basis, scope.root, scope.reach) == ("ecosystem", root, reach)
+    assert suffix in scope.suffixes
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "crate/Cargo.toml",
+        "Cargo.lock",
+        "Makefile",
+        "Dockerfile",
+        ".github/workflows/ci.yml",
+        "tests/fixtures/package.json",
+        "tests/data/pyproject.toml",
+        "__init__.py",
+    ],
+)
+def test_what_can_change_any_test_keeps_its_full_run(path) -> None:
+    assert path not in _scopes([path])
+
+
+def test_a_configured_full_run_trigger_is_never_scoped() -> None:
+    config = TestSelectionConfig(full_run_on=("web/package.json",))
+    assert _scopes(["web/package.json"], config=config) == {}
+
+
+def test_a_production_package_init_scopes_to_the_modules_under_it() -> None:
+    scope = _scopes(["src/pkg/__init__.py"])["src/pkg/__init__.py"]
+    assert (scope.basis, scope.root) == ("package-importers", "src/pkg")
+    assert scope.reach == ("src/pkg/__init__.py", "src/pkg/core.py", "src/pkg/sub/deep.py")
+
+
+def test_a_non_code_file_runs_what_names_it_or_its_package() -> None:
+    css = "web/src/styles/layout.css"
+    named = _scopes([css], {css: ["web/src/app.ts"]})[css]
+    assert (named.basis, named.root, named.namers) == ("named-by", None, ("web/src/app.ts",))
+    # A name written only outside the package may be another file's.
+    elsewhere = _scopes([css], {css: ["src/other.py"]})[css]
+    assert (elsewhere.basis, elsewhere.root) == ("owner-package", "web")
+    assert elsewhere.namers == ("src/other.py",) and elsewhere.reach == ("web/src/app.ts",)
+    owned = _scopes([css])[css]
+    assert (owned.basis, owned.root, owned.suffixes) == ("owner-package", "web", ())
+    # The repository root is no package; a doc no code names needs nothing.
+    assert _scopes(["assets/logo.svg", "docs/guide.md"]) == {}
+    changelog = _scopes(["CHANGELOG.md"], {"CHANGELOG.md": ["scripts/lanes.mjs"]})
+    assert changelog["CHANGELOG.md"].namers == ("scripts/lanes.mjs",)
+    # A doctest glob makes the doc a test.
+    assert _scopes(["README.md"], {"README.md": ["pytest.ini"]}) == {}
+
+
+def test_file_namers_lists_every_file_naming_one() -> None:
+    sources = [
+        ("web/src/app.ts", 'import "./styles/layout.css";\n'),
+        ("src/other.py", 'CSS = "layout.css"\n'),
+        ("pyproject.toml", 'x = "layout.css"\n'),
+    ]
+    assert file_namers(["web/src/styles/layout.css"], sources) == {
+        "web/src/styles/layout.css": ["web/src/app.ts", "src/other.py"]
+    }
+
+
+def _scoped(paths, tiers=None, namers=None, **kwargs):
+    kwargs.setdefault("known_tests", _SCOPE_TESTS)
+    return _select(paths, tiers, scopes=_scopes(paths, namers), **kwargs)
+
+
+def test_a_js_package_manifest_runs_its_tests_and_those_reaching_its_code() -> None:
+    tiers = _tiers(inferred=[_inferred("web/src/app.ts", "tests/test_core.py", "import-graph")])
+    sel = _scoped(["web/package.json"], tiers)
+    assert not sel.run_all, sel.reasons
+    assert sel.test_files == (
+        "web/src/app.test.ts",
+        "web/e2e/login.spec.ts",
+        "tests/test_core.py",
+    )
+    assert sel.basis == {"web/package.json": "ecosystem"}
+    assert sel.reasons[0].startswith("web/package.json changed: it can change the JavaScript")
+
+
+def test_a_python_lockfile_runs_only_python_tests_and_needs_no_graph() -> None:
+    sel = _scoped(["uv.lock"], index_available=False)
+    assert not sel.run_all, sel.reasons
+    assert sel.test_files == ("tests/test_core.py",)
+
+
+def test_a_scope_with_no_test_runs_everything() -> None:
+    sel = _scoped(["svc/go.mod"], known_tests=[])
+    assert sel.run_all
+    assert sel.reasons[0].startswith("svc/go.mod changed: it can change the Go tests under svc/")
+    assert sel.reasons[0].endswith("and no such test is known.")
+
+
+def test_a_namer_no_test_reaches_runs_everything() -> None:
+    css = "web/src/styles/layout.css"
+    sel = _scoped([css], namers={css: ["web/src/app.ts"]})
+    assert sel.run_all
+    assert sel.reasons[0] == f"{css} is named by web/src/app.ts, and no test is known to reach it."
+    tiers = _tiers(inferred=[_inferred("web/src/app.ts", "web/src/app.test.ts", "import-graph")])
+    reached = _scoped([css], tiers, namers={css: ["web/src/app.ts"]})
+    assert not reached.run_all and reached.test_files == ("web/src/app.test.ts",)
+    assert reached.basis == {css: "named-by"}
+
+
+def test_a_route_through_an_unimported_helper_still_runs_everything() -> None:
+    tiers = _tiers(inferred=[_inferred("src/pkg/core.py", "tests/helpers.py", "import-graph")])
+    sel = _scoped(["src/pkg/__init__.py"], tiers)
+    assert sel.run_all
+    assert sel.reasons[0].startswith(
+        "src/pkg/__init__.py changed; src/pkg/core.py is reached through the test helper"
+    )
+
+
+def test_a_scope_that_walks_the_graph_needs_the_index() -> None:
+    sel = _scoped(["web/package.json"], index_available=False)
+    assert sel.run_all and sel.reasons[0].startswith("No index")
+
+
+def test_unplaced_tests_run_with_a_scoped_selection() -> None:
+    sel = _scoped(["uv.lock"], unplaced_tests=["tests/test_cli.py"])
+    assert sel.test_files == ("tests/test_core.py", "tests/test_cli.py")
+
