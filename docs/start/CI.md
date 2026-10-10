@@ -260,7 +260,8 @@ a per-test coverage map (`repowise coverage add`) makes it more precise.
 - Tests the graph cannot see into (not indexed, or importing nothing it resolves, such as a test that only runs a subprocess) run with every subset. A Python module named like a test but outside every test directory is not a test when the nearest pytest config's `testpaths` or `python_files` leaves it out, as a bare `pytest` does: it is selected through like any other code. The rule follows a bare `pytest` run, so a test that CI only names explicitly on the command line outside `testpaths` is not seen as one: list it in `tests.always_run`.
 - A changed `conftest.py`, test package `__init__.py` or imported test helper selects the tests under or importing it, not everything.
 - Without a range, in CI it reads the pull request's change; locally, the staged changes.
-- `tests.full_run_on` (gitignore patterns) adds run-everything paths; `tests.always_run` is appended to every selection as written.
+- `tests.full_run_on` (gitignore patterns) adds run-everything paths; `tests.always_run` is appended to every selection as written, for the runner whose language each entry is in.
+- With `--runner pytest`, `go` or `jest`, the arguments hold only that runner's tests, `tests.always_run` included. A repository with tests in several languages needs one job per runner: the tests a job leaves out are counted on stderr, and listed per runner under `left_out` with `--format json`. `--runner files` gets every test.
 - Ceiling: on the JVM and .NET, a same-package test linked only by an unresolved call is missed. A test that reaches the change only through a subprocess, a plugin or registry loaded by a string name, or a directory it globs, while importing something else, is missed too: list such tests in `tests.always_run`, and run the full suite on the default branch.
 
 **What to expect.** The subset is only as small as the code is loosely coupled.

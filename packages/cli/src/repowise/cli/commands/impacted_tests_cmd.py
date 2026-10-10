@@ -610,11 +610,18 @@ def _render(result: dict, fmt: str, runner: str = "auto") -> None:
 
 def _render_selection(result: dict, fmt: str, runner: str) -> None:
     """``--format args`` (one line, reasons on stderr) or ``--format json``."""
-    from repowise.core.analysis.test_selection import format_args, resolve_runner, runner_args
+    from repowise.core.analysis.test_selection import (
+        format_args,
+        left_out,
+        resolve_runner,
+        runner_args,
+        runner_notes,
+    )
 
     selection = result["selection"]
     resolved = resolve_runner(selection, runner)
     args = runner_args(selection, resolved)
+    notes = runner_notes(selection, resolved)
     if fmt == "args":
         click.echo(format_args(args))
         # Plain stderr, one reason per line: a CI log must not wrap or style them.
@@ -622,12 +629,12 @@ def _render_selection(result: dict, fmt: str, runner: str) -> None:
             click.echo("Run every test:", err=True)
         else:
             click.echo(f"{len(args)} argument(s) for {resolved}.", err=True)
-        for reason in selection.reasons:
+        for reason in (*selection.reasons, *notes):
             click.echo(f"  {reason}", err=True)
         return
 
     selected = selection.to_dict()
-    run_all, reasons = selected.pop("run_all"), selected.pop("reasons")
+    run_all, reasons = selected.pop("run_all"), selected.pop("reasons") + notes
     emit_json(
         {
             "diff": result["diff"],
@@ -652,6 +659,7 @@ def _render_selection(result: dict, fmt: str, runner: str) -> None:
             "selected": selected,
             "runner": resolved,
             "args": args,
+            "left_out": left_out(selection, resolved),
         }
     )
 
